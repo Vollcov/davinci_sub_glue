@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Subtitle Glue for DaVinci Resolve.
+Remove gap sub for DaVinci Resolve.
 
 Reads generated subtitle clips on the active timeline and removes empty
 gaps by extending each caption until the next one starts. If a caption
@@ -14,7 +14,7 @@ export the timeline, replace subtitle durations on the existing track,
 re-import. That creates a new timeline with the old captions already
 replaced at the original timecode — no extra subtitle track.
 
-Run from: Workspace > Scripts > Utility > SubtitleGlue
+Run from: Workspace > Scripts > Utility > Remove gap sub
 """
 
 from __future__ import print_function
@@ -27,9 +27,10 @@ import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
 
-VERSION = "1.9.0"
-SCRIPT_ID = "SubtitleGlueWin"
-MEDIA_FOLDER_NAME = "Subtitle Glue"
+VERSION = "1.9.1"
+SCRIPT_NAME = "Remove gap sub"
+SCRIPT_ID = "RemoveGapSubWin"
+MEDIA_FOLDER_NAME = "Remove gap sub"
 DRT_BREAK = "<br>"
 _DRT_ESC = re.compile(r"(</?)([A-Za-z_][\w.\-]*)::")
 _DRT_UNESC = re.compile(r"(</?)([A-Za-z_][\w.\-]*)__CC__")
@@ -778,7 +779,7 @@ def show_message(fusion_app, title, text):
     dispatcher = bmd_mod.UIDispatcher(ui)
     win = dispatcher.AddWindow(
         {
-            "ID": "SubtitleGlueMsg",
+            "ID": "RemoveGapSubMsg",
             "WindowTitle": title,
             "Geometry": [200, 200, 520, 240],
         },
@@ -797,7 +798,7 @@ def show_message(fusion_app, title, text):
     def _close(_ev):
         dispatcher.ExitLoop()
 
-    win.On.SubtitleGlueMsg.Close = _close
+    win.On.RemoveGapSubMsg.Close = _close
     win.On.ok.Clicked = _close
     items["msg"].Text = text
     win.Show()
@@ -813,7 +814,7 @@ def show_ui_and_run(resolve_app, project, timeline):
 
     tracks = list_subtitle_tracks(timeline)
     if not tracks:
-        show_message(fusion_app, "Subtitle Glue", "На активном таймлайне нет subtitle-дорожек.")
+        show_message(fusion_app, SCRIPT_NAME, "На активном таймлайне нет subtitle-дорожек.")
         return False
 
     ui = fusion_app.UIManager
@@ -821,7 +822,7 @@ def show_ui_and_run(resolve_app, project, timeline):
     win = dispatcher.AddWindow(
         {
             "ID": SCRIPT_ID,
-            "WindowTitle": "Subtitle Glue v%s" % VERSION,
+            "WindowTitle": "%s v%s" % (SCRIPT_NAME, VERSION),
             "Geometry": [120, 120, 560, 400],
         },
         [
@@ -925,14 +926,14 @@ def show_ui_and_run(resolve_app, project, timeline):
             )
         except Exception as exc:
             items["status"].Text = "Ошибка: %s" % exc
-            print("Subtitle Glue error: %s" % exc)
+            print("%s error: %s" % (SCRIPT_NAME, exc))
             return
         message = "\n".join(summaries) if summaries else "Нечего обрабатывать."
         items["status"].Text = message
         result["ran"] = True
-        print("Subtitle Glue:\n%s" % message)
+        print("%s:\n%s" % (SCRIPT_NAME, message))
 
-    win.On.SubtitleGlueWin.Close = close_window
+    win.On.RemoveGapSubWin.Close = close_window
     win.On.cancelBtn.Clicked = close_window
     win.On.runBtn.Clicked = on_run
     win.Show()
@@ -958,14 +959,14 @@ def main():
     project = resolve_app.GetProjectManager().GetCurrentProject()
     if project is None:
         msg = "Нет активного проекта."
-        show_message(get_fusion(resolve_app), "Subtitle Glue", msg)
+        show_message(get_fusion(resolve_app), SCRIPT_NAME, msg)
         print(msg)
         return 1
 
     timeline = project.GetCurrentTimeline()
     if timeline is None:
         msg = "Нет активного таймлайна."
-        show_message(get_fusion(resolve_app), "Subtitle Glue", msg)
+        show_message(get_fusion(resolve_app), SCRIPT_NAME, msg)
         print(msg)
         return 1
 

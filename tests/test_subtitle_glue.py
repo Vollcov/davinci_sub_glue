@@ -7,7 +7,7 @@ import zipfile
 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-SCRIPT = os.path.join(ROOT, "SubtitleGlue.py")
+SCRIPT = os.path.join(ROOT, "Remove gap sub.py")
 
 
 def load_script():

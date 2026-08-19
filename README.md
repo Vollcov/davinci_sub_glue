@@ -1,6 +1,6 @@
 # davinci_sub_glue
 
-Скрипт **Subtitle Glue** для DaVinci Resolve: читает сгенерированные субтитры на активном таймлайне и убирает пустые промежутки между ними, удлиняя каждый субтитр до начала следующего.
+Скрипт **Remove gap sub** для DaVinci Resolve: читает сгенерированные субтитры на активном таймлайне и убирает пустые промежутки между ними, удлиняя каждый субтитр до начала следующего.
 
 ## Как это работает
 
@@ -16,7 +16,7 @@ API Resolve не умеет менять длительность уже леж�
 
 ## Установка
 
-Скопируйте `SubtitleGlue.py` в папку скриптов Resolve:
+Скопируйте `Remove gap sub.py` в папку скриптов Resolve:
 
 | ОС | Папка |
 | --- | --- |
@@ -24,12 +24,14 @@ API Resolve не умеет менять длительность уже леж�
 | macOS | `~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/` |
 | Linux | `~/.local/share/DaVinciResolve/Fusion/Scripts/Utility/` |
 
+Если там лежит старый `SubtitleGlue.py`, удалите его, чтобы в меню не было двух скриптов.
+
 Перезапустите Resolve (или обновите список скриптов).
 
 ## Как пользоваться
 
 1. Откройте проект и **активный таймлайн** с уже сгенерированными субтитрами (`Timeline > Create Subtitles from Audio`).
-2. Меню: **Workspace → Scripts → Utility → SubtitleGlue**.
+2. Меню: **Workspace → Scripts → Utility → Remove gap sub**.
 3. Выберите дорожку, зазор в кадрах и лимит удлинения.
 4. Нажмите **Заполнить паузы**.
 
