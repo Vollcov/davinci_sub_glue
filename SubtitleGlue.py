@@ -2,10 +2,14 @@
 """
 Subtitle Glue for DaVinci Resolve.
 
-Reads subtitle clips on the active timeline and removes empty gaps by
-extending each caption until the next one starts. Resolve cannot trim
-native subtitle items in place, so the script rebuilds the track from
-an SRT file with the new timings.
+Reads generated subtitle clips on the active timeline and removes empty
+gaps by extending each caption until the next one starts.
+
+Native subtitle clips cannot be trimmed, moved, or reliably deleted
+through the scripting API. Importing an SRT also ignores recordFrame and
+is always appended after the last existing caption. This script therefore
+rebuilds the result as Text+ clips on a video track (where recordFrame
+works) and disables the original subtitle track.
 
 Run from: Workspace > Scripts > Utility > SubtitleGlue
 """
@@ -16,7 +20,7 @@ import os
 import sys
 import tempfile
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 SCRIPT_ID = "SubtitleGlueWin"
 MEDIA_FOLDER_NAME = "Subtitle Glue"
 
@@ -77,7 +81,6 @@ def fill_gaps(cues, gap_frames=0, max_extend_frames=0):
                     new_end = new_end + extension
                     filled += 1
                     extra_frames += extension
-            # Never overlap the next cue and never shrink the original.
             new_end = max(cue.end, min(new_end, ordered[index + 1].start - gap_frames))
             if new_end < cue.end:
                 new_end = cue.end
@@ -130,15 +133,9 @@ def write_srt_file(path, cues, fps):
     return path
 
 
-def count_extended(original, filled_cues):
-    """How many cues grew, and by how many frames."""
-    grown = 0
-    extra = 0
-    for before, after in zip(original, filled_cues):
-        if after.end > before.end:
-            grown += 1
-            extra += after.end - before.end
-    return grown, extra
+def to_record_frame(relative_start, offset):
+    """Convert a timeline-relative cue start to AppendToTimeline recordFrame."""
+    return int(relative_start) + int(offset or 0)
 
 
 def unique_frames(*values):
@@ -153,18 +150,10 @@ def unique_frames(*values):
 
 
 def record_frame_candidates(timeline_start, offset, first_cue_abs=None):
-    """Frames to try when placing an SRT clip.
-
-    Resolve is inconsistent about whether recordFrame is 0-based from the
-    timeline start or an absolute GetStartFrame() value. Trying 0 first
-    avoids dropping the clip one hour later (01:00:00:00) at the end of
-    the old subtitles.
-    """
     return unique_frames(0, offset, timeline_start, first_cue_abs)
 
 
 def is_placement_aligned(actual_start, expected_starts, tolerance=2):
-    """True if the first placed subtitle starts at a timeline origin."""
     if actual_start is None:
         return False
     actual_start = int(actual_start)
@@ -262,7 +251,6 @@ def read_subtitle_track(timeline, track_index):
             min_start = start
         cues.append(Cue(start, end, item.GetName() or ""))
 
-    # Convert to timeline-relative frames for the SRT file.
     offset = timeline_start
     if cues and min_start is not None and min_start < timeline_start:
         offset = 0
@@ -291,35 +279,6 @@ def find_or_create_media_folder(media_pool, name):
     return created or root, current
 
 
-def subtitle_track_count(timeline):
-    return int(timeline.GetTrackCount("subtitle") or 0)
-
-
-def items_on_track(timeline, track_index):
-    return list(timeline.GetItemListInTrack("subtitle", track_index) or [])
-
-
-def all_subtitle_items(timeline):
-    items = []
-    for index in range(1, subtitle_track_count(timeline) + 1):
-        items.extend(items_on_track(timeline, index))
-    return items
-
-
-def first_item_start(items):
-    if not items:
-        return None
-    return min(int(item.GetStart()) for item in items)
-
-
-def find_empty_subtitle_tracks(timeline):
-    empty = []
-    for index in range(1, subtitle_track_count(timeline) + 1):
-        if not items_on_track(timeline, index):
-            empty.append(index)
-    return empty
-
-
 def set_playhead_to_start(timeline):
     getter = getattr(timeline, "GetStartTimecode", None)
     setter = getattr(timeline, "SetCurrentTimecode", None)
@@ -333,280 +292,254 @@ def set_playhead_to_start(timeline):
         pass
 
 
-def capture_track_writable_state(timeline):
-    states = []
-    for index in range(1, subtitle_track_count(timeline) + 1):
-        states.append({
-            "index": index,
-            "locked": bool(timeline.GetIsTrackLocked("subtitle", index)),
-            "enabled": bool(timeline.GetIsTrackEnabled("subtitle", index)),
-        })
-    return states
+def video_items(timeline):
+    items = []
+    count = int(timeline.GetTrackCount("video") or 0)
+    for index in range(1, count + 1):
+        items.extend(timeline.GetItemListInTrack("video", index) or [])
+    return items
 
 
-def isolate_subtitle_track(timeline, target_index):
-    states = capture_track_writable_state(timeline)
-    for state in states:
-        index = state["index"]
-        if index == target_index:
-            timeline.SetTrackLock("subtitle", index, False)
-            timeline.SetTrackEnable("subtitle", index, True)
-        else:
-            timeline.SetTrackLock("subtitle", index, True)
-    return states
-
-
-def restore_track_writable_state(timeline, states):
-    count = subtitle_track_count(timeline)
-    for state in states:
-        index = state["index"]
-        if index < 1 or index > count:
-            continue
+def harvest_textplus_template(timeline):
+    """Insert a temporary Text+ title and return its media pool item."""
+    set_playhead_to_start(timeline)
+    before_ids = set(id(item) for item in video_items(timeline))
+    inserted = None
+    for title_name in ("Text+", "Text"):
         try:
-            timeline.SetTrackLock("subtitle", index, state["locked"])
-            timeline.SetTrackEnable("subtitle", index, state["enabled"])
+            inserted = timeline.InsertFusionTitleIntoTimeline(title_name)
         except Exception:
-            pass
-
-
-def delete_timeline_items(timeline, items):
-    if not items:
-        return True
-    try:
-        return bool(timeline.DeleteClips(list(items), False))
-    except Exception:
-        return False
-
-
-def add_empty_subtitle_track(timeline, name):
-    before_empty = set(find_empty_subtitle_tracks(timeline))
-    before_count = subtitle_track_count(timeline)
-    if not timeline.AddTrack("subtitle"):
+            inserted = None
+        if inserted:
+            break
+    item = inserted if inserted and not isinstance(inserted, bool) else None
+    if item is None:
+        for maybe in video_items(timeline):
+            if id(maybe) not in before_ids:
+                item = maybe
+                break
+    if item is None:
         return None
-    created = [
-        index
-        for index in find_empty_subtitle_tracks(timeline)
-        if index not in before_empty
-    ]
-    if not created:
-        index = subtitle_track_count(timeline)
-    elif 1 in created and subtitle_track_count(timeline) == before_count + 1:
-        # AddTrack prepended the new empty track.
-        index = 1
-    else:
-        index = max(created)
-    if name:
-        timeline.SetTrackName("subtitle", index, name)
-    return index
-
-
-def clear_subtitle_track(timeline, track_index, original_name):
-    """Remove clips from a subtitle track, recreating it if DeleteClips fails."""
-    items = items_on_track(timeline, track_index)
-    if items:
-        delete_timeline_items(timeline, items)
-    if not items_on_track(timeline, track_index):
-        return track_index
+    media_item = item.GetMediaPoolItem()
     try:
-        timeline.DeleteTrack("subtitle", track_index)
+        timeline.DeleteClips([item], False)
     except Exception:
         pass
-    index = add_empty_subtitle_track(timeline, original_name)
-    return index
+    return media_item
 
 
-def append_srt_clip(media_pool, clip, track_index, record_frame):
-    attempts = [
-        {
-            "mediaPoolItem": clip,
-            "recordFrame": int(record_frame),
-            "trackIndex": int(track_index),
-        },
-        {
-            "mediaPoolItem": clip,
+def measure_duration_multiplier(media_pool, timeline, text_clip, track_index):
+    test_duration = 100
+    clip_info = {
+        "mediaPoolItem": text_clip,
+        "startFrame": 0,
+        "endFrame": test_duration - 1,
+        "trackIndex": track_index,
+        "recordFrame": get_timeline_start(timeline),
+    }
+    try:
+        items = media_pool.AppendToTimeline([clip_info])
+        if not items:
+            return 1.0
+        real_duration = int(items[0].GetDuration() or 0)
+        timeline.DeleteClips(list(items), False)
+        if real_duration <= 0:
+            return 1.0
+        return float(test_duration) / float(real_duration)
+    except Exception:
+        return 1.0
+
+
+def set_textplus_text(timeline_item, text):
+    count = int(timeline_item.GetFusionCompCount() or 0)
+    for index in range(1, count + 1):
+        comp = timeline_item.GetFusionCompByIndex(index)
+        if not comp:
+            continue
+        tool = None
+        finder = getattr(comp, "FindToolByID", None)
+        if finder:
+            try:
+                tool = finder("TextPlus")
+            except Exception:
+                tool = None
+        if tool is None:
+            getter = getattr(comp, "GetToolList", None)
+            tools = getter(False) if getter else None
+            values = []
+            if isinstance(tools, dict):
+                values = list(tools.values())
+            elif tools:
+                try:
+                    values = list(tools)
+                except TypeError:
+                    values = []
+            for maybe in values:
+                try:
+                    attrs = maybe.GetAttrs() or {}
+                    if attrs.get("TOOLS_RegID") == "TextPlus" or maybe.ID == "TextPlus":
+                        tool = maybe
+                        break
+                except Exception:
+                    continue
+        if tool:
+            tool.SetInput("StyledText", text)
+            return True
+    return False
+
+
+def append_textplus_with_duration(
+    media_pool, timeline, text_clip, track_index, record_frame, target_duration, duration_multiplier
+):
+    source_duration = max(1, int(target_duration * duration_multiplier + 0.999))
+    for attempt in range(4):
+        clip_info = {
+            "mediaPoolItem": text_clip,
             "startFrame": 0,
+            "endFrame": source_duration - 1,
+            "trackIndex": track_index,
             "recordFrame": int(record_frame),
-            "trackIndex": int(track_index),
-        },
-        {
-            "mediaPoolItem": clip,
-            "recordFrame": int(record_frame),
-        },
-    ]
-    for info in attempts:
-        placed = media_pool.AppendToTimeline([info])
-        if placed:
-            return placed
+        }
+        items = media_pool.AppendToTimeline([clip_info])
+        if not items:
+            return None
+        timeline_item = items[0]
+        actual = int(timeline_item.GetDuration() or 0)
+        adjustment = int(target_duration) - actual
+        adjusted = max(1, source_duration + adjustment)
+        if adjustment == 0 or adjusted == source_duration or attempt == 3:
+            return timeline_item
+        try:
+            timeline.DeleteClips([timeline_item], False)
+        except Exception:
+            return timeline_item
+        source_duration = adjusted
     return None
 
 
-def new_items_since(timeline, before_ids):
-    before = set(before_ids)
-    return [item for item in all_subtitle_items(timeline) if id(item) not in before]
-
-
-def place_srt_aligned(media_pool, timeline, clip, track_index, expected_starts):
-    """Place an SRT so the first caption starts at the beginning of the timeline."""
-    set_playhead_to_start(timeline)
-    states = isolate_subtitle_track(timeline, track_index)
-    last_new = []
+def hide_subtitle_track(timeline, track_index):
+    """Disable the original captions. Delete is attempted but often ignored."""
     try:
-        candidates = unique_frames(*(expected_starts or [0]))
-        for record_frame in candidates:
-            before_ids = [id(item) for item in all_subtitle_items(timeline)]
-            placed = append_srt_clip(media_pool, clip, track_index, record_frame)
-            new_items = new_items_since(timeline, before_ids)
-            if not new_items and placed:
-                new_items = list(placed)
-            last_new = new_items
-            actual = first_item_start(new_items)
-            print(
-                "Subtitle Glue: place recordFrame=%s start=%s expected=%s"
-                % (record_frame, actual, expected_starts)
-            )
-            if new_items and is_placement_aligned(actual, expected_starts):
-                return new_items
-            if new_items:
-                delete_timeline_items(timeline, new_items)
-
-        before_ids = [id(item) for item in all_subtitle_items(timeline)]
-        placed = media_pool.AppendToTimeline([clip])
-        new_items = new_items_since(timeline, before_ids)
-        if not new_items and placed:
-            new_items = list(placed)
-        last_new = new_items
-        actual = first_item_start(new_items)
-        print(
-            "Subtitle Glue: place append-fallback start=%s expected=%s"
-            % (actual, expected_starts)
-        )
-        if new_items and is_placement_aligned(actual, expected_starts):
-            return new_items
-        dest_items = items_on_track(timeline, track_index)
-        if dest_items and is_placement_aligned(first_item_start(dest_items), expected_starts):
-            return dest_items
-        return last_new
-    finally:
-        restore_track_writable_state(timeline, states)
-
-
-def _item_is_on_subtitle_track(item, expected_index):
-    getter = getattr(item, "GetTrackTypeAndIndex", None)
-    if getter is None:
-        return True
-    try:
-        info = getter()
+        timeline.SetTrackLock("subtitle", track_index, False)
     except Exception:
-        return True
-    if not info:
-        return True
-    track_type, track_index = info[0], info[1]
-    if str(track_type).lower() != "subtitle":
-        return False
-    if expected_index and int(track_index) != int(expected_index):
-        return False
-    return True
+        pass
+    items = timeline.GetItemListInTrack("subtitle", track_index) or []
+    if items:
+        try:
+            timeline.DeleteClips(list(items), False)
+        except Exception:
+            pass
+    remaining = timeline.GetItemListInTrack("subtitle", track_index) or []
+    if remaining:
+        try:
+            timeline.DeleteTrack("subtitle", track_index)
+            return "deleted"
+        except Exception:
+            pass
+        try:
+            timeline.SetTrackEnable("subtitle", track_index, False)
+            return "disabled"
+        except Exception:
+            return "kept"
+    return "cleared"
 
 
-def rebuild_track_from_srt(resolve_app, project, timeline, track_index, cues, fps, offset, replace_original):
+def export_srt_sidecar(project, cues, fps, track_name):
     media_pool = project.GetMediaPool()
-    original_name = timeline.GetTrackName("subtitle", track_index) or ("Subtitle %d" % track_index)
-    timeline_start = get_timeline_start(timeline)
-    first_cue_abs = (cues[0].start + offset) if cues else offset
-    expected_starts = record_frame_candidates(timeline_start, offset, first_cue_abs)
-
     fd, srt_path = tempfile.mkstemp(prefix="subtitle_glue_", suffix=".srt")
     os.close(fd)
     write_srt_file(srt_path, cues, fps)
+    folder, previous = find_or_create_media_folder(media_pool, MEDIA_FOLDER_NAME)
+    if folder:
+        media_pool.SetCurrentFolder(folder)
+    try:
+        media_pool.ImportMedia([os.path.abspath(srt_path)])
+    except Exception:
+        pass
+    if previous:
+        media_pool.SetCurrentFolder(previous)
+    return srt_path
 
+
+def rebuild_as_textplus(
+    resolve_app, project, timeline, track_index, cues, fps, offset, hide_original
+):
+    """Place gap-filled captions as Text+ clips at the original timeline times."""
     try:
         resolve_app.OpenPage("edit")
     except Exception:
         pass
+    try:
+        project.SetCurrentTimeline(timeline)
+    except Exception:
+        pass
 
-    folder, previous_folder = find_or_create_media_folder(media_pool, MEDIA_FOLDER_NAME)
+    media_pool = project.GetMediaPool()
+    folder, previous = find_or_create_media_folder(media_pool, MEDIA_FOLDER_NAME)
     if folder:
         media_pool.SetCurrentFolder(folder)
 
-    imported = media_pool.ImportMedia([os.path.abspath(srt_path)])
-    if previous_folder:
-        media_pool.SetCurrentFolder(previous_folder)
-
-    if not imported:
+    text_clip = harvest_textplus_template(timeline)
+    if previous:
+        media_pool.SetCurrentFolder(previous)
+    if text_clip is None:
         raise RuntimeError(
-            "Не удалось импортировать SRT в Media Pool.\nФайл сохранён: %s" % srt_path
+            "Не удалось создать шаблон Text+.\n"
+            "Откройте Edit, добавьте вручную Fusion Title «Text+» в Media Pool и повторите."
         )
-    clip = imported[0]
 
-    if timeline.GetIsTrackLocked("subtitle", track_index):
-        timeline.SetTrackLock("subtitle", track_index, False)
+    if not timeline.AddTrack("video"):
+        raise RuntimeError("Не удалось создать видеодорожку для Text+.")
+    video_track = int(timeline.GetTrackCount("video"))
+    original_name = timeline.GetTrackName("subtitle", track_index) or ("Subtitle %d" % track_index)
+    timeline.SetTrackName("video", video_track, "%s (без пауз)" % original_name)
 
-    destination = track_index
-    extra_track = None
-    if replace_original:
-        # Clear first. AppendToTimeline ignores recordFrame for SRT and
-        # otherwise concatenates after the old captions.
-        destination = clear_subtitle_track(timeline, track_index, original_name)
-        if destination is None:
-            raise RuntimeError("Не удалось очистить исходную subtitle-дорожку.")
-    else:
-        extra_track = add_empty_subtitle_track(timeline, "%s (без пауз)" % original_name)
-        if extra_track is None:
-            raise RuntimeError("Не удалось создать новую subtitle-дорожку.")
-        destination = extra_track
-
-    placed_items = place_srt_aligned(
-        media_pool, timeline, clip, destination, expected_starts
+    duration_multiplier = measure_duration_multiplier(
+        media_pool, timeline, text_clip, video_track
     )
-    if not placed_items:
-        if extra_track:
-            try:
-                timeline.DeleteTrack("subtitle", extra_track)
-            except Exception:
-                pass
-        raise RuntimeError(
-            "Не удалось положить SRT на таймлайн.\nИмпортируйте вручную: %s" % srt_path
+    created = []
+    first_expected = to_record_frame(cues[0].start, offset) if cues else 0
+    for cue in cues:
+        duration = max(1, cue.end - cue.start)
+        record_frame = to_record_frame(cue.start, offset)
+        item = append_textplus_with_duration(
+            media_pool,
+            timeline,
+            text_clip,
+            video_track,
+            record_frame,
+            duration,
+            duration_multiplier,
+        )
+        if item is None:
+            continue
+        try:
+            item.SetClipColor("Green")
+        except Exception:
+            pass
+        set_textplus_text(item, cue.text)
+        created.append(item)
+
+    if not created:
+        try:
+            timeline.DeleteTrack("video", video_track)
+        except Exception:
+            pass
+        raise RuntimeError("Не удалось поставить Text+ клипы на таймлайн.")
+
+    actual_first = int(created[0].GetStart())
+    if not is_placement_aligned(actual_first, [first_expected, offset, 0, get_timeline_start(timeline)]):
+        print(
+            "Subtitle Glue warning: first Text+ starts at %s, expected %s"
+            % (actual_first, first_expected)
         )
 
-    actual_start = first_item_start(placed_items)
-    if not is_placement_aligned(actual_start, expected_starts):
-        delete_timeline_items(timeline, placed_items)
-        if extra_track:
-            try:
-                timeline.DeleteTrack("subtitle", extra_track)
-            except Exception:
-                pass
-        raise RuntimeError(
-            "SRT попал не в начало таймлайна (кадр %s, ожидалось %s).\n"
-            "Перетащите файл на пустую subtitle-дорожку в начало таймлайна:\n%s"
-            % (actual_start, expected_starts, srt_path)
-        )
+    hide_status = "kept"
+    if hide_original:
+        hide_status = hide_subtitle_track(timeline, track_index)
 
-    if not _item_is_on_subtitle_track(placed_items[0], destination):
-        delete_timeline_items(timeline, placed_items)
-        if extra_track:
-            try:
-                timeline.DeleteTrack("subtitle", extra_track)
-            except Exception:
-                pass
-        raise RuntimeError(
-            "Resolve положил клип не на subtitle-дорожку.\n"
-            "Перетащите файл на subtitle-трек вручную:\n%s" % srt_path
-        )
-
-    new_items = items_on_track(timeline, destination) or placed_items
-    if not new_items:
-        if extra_track:
-            try:
-                timeline.DeleteTrack("subtitle", extra_track)
-            except Exception:
-                pass
-        raise RuntimeError(
-            "Новая дорожка пустая после импорта.\nФайл: %s" % srt_path
-        )
-
-    timeline.SetTrackName("subtitle", destination, original_name if replace_original else ("%s (без пауз)" % original_name))
-    return srt_path, len(new_items)
+    srt_path = export_srt_sidecar(project, cues, fps, original_name)
+    return srt_path, len(created), hide_status
 
 
 def glue_tracks(resolve_app, project, timeline, track_indices, gap_frames, max_extend_seconds, replace_original):
@@ -614,7 +547,6 @@ def glue_tracks(resolve_app, project, timeline, track_indices, gap_frames, max_e
     max_extend_frames = int(round(float(max_extend_seconds) * fps)) if max_extend_seconds else 0
 
     summaries = []
-    # Process from highest index to lowest so deletions do not shift remaining targets.
     for track_index in sorted(track_indices, reverse=True):
         cues, _items, offset = read_subtitle_track(timeline, track_index)
         if len(cues) < 2:
@@ -626,7 +558,7 @@ def glue_tracks(resolve_app, project, timeline, track_indices, gap_frames, max_e
         if grown == 0:
             summaries.append("S%d: пауз нет, дорожка не изменена." % track_index)
             continue
-        srt_path, placed_count = rebuild_track_from_srt(
+        srt_path, placed_count, hide_status = rebuild_as_textplus(
             resolve_app,
             project,
             timeline,
@@ -637,9 +569,15 @@ def glue_tracks(resolve_app, project, timeline, track_indices, gap_frames, max_e
             replace_original,
         )
         seconds = extra / fps
+        hide_note = {
+            "deleted": "исходная subtitle-дорожка удалена",
+            "cleared": "исходные клипы удалены",
+            "disabled": "исходная subtitle-дорожка отключена (API не даёт удалить клипы)",
+            "kept": "исходная дорожка оставлена",
+        }.get(hide_status, hide_status)
         summaries.append(
-            "S%d: удлинено %d из %d субтитров (+%.2f с, клипов: %d).\nSRT: %s"
-            % (track_index, grown, len(cues), seconds, placed_count, srt_path)
+            "S%d: Text+ %d клипов, удлинено %d из %d (+%.2f с). %s.\nSRT: %s"
+            % (track_index, placed_count, grown, len(cues), seconds, hide_note, srt_path)
         )
     return summaries
 
@@ -660,7 +598,7 @@ def show_message(fusion_app, title, text):
         {
             "ID": "SubtitleGlueMsg",
             "WindowTitle": title,
-            "Geometry": [200, 200, 520, 220],
+            "Geometry": [200, 200, 520, 240],
         },
         [
             ui.VGroup(
@@ -702,7 +640,7 @@ def show_ui_and_run(resolve_app, project, timeline):
         {
             "ID": SCRIPT_ID,
             "WindowTitle": "Subtitle Glue v%s" % VERSION,
-            "Geometry": [120, 120, 520, 360],
+            "Geometry": [120, 120, 560, 400],
         },
         [
             ui.VGroup(
@@ -710,7 +648,12 @@ def show_ui_and_run(resolve_app, project, timeline):
                 [
                     ui.Label(
                         {
-                            "Text": "Удлиняет субтитры на активном таймлайне, чтобы закрыть пустые паузы между ними.",
+                            "Text": (
+                                "Закрывает паузы между субтитрами. Resolve не умеет "
+                                "менять длительность subtitle-клипов и всегда дописывает "
+                                "SRT в конец дорожки, поэтому результат ставится как Text+ "
+                                "на видеодорожку в исходных таймкодах."
+                            ),
                             "WordWrap": True,
                             "Weight": 0,
                         }
@@ -755,7 +698,7 @@ def show_ui_and_run(resolve_app, project, timeline):
                     ui.CheckBox(
                         {
                             "ID": "replaceCheck",
-                            "Text": "Заменить исходную дорожку",
+                            "Text": "Скрыть исходную subtitle-дорожку",
                             "Checked": True,
                             "Weight": 0,
                         }

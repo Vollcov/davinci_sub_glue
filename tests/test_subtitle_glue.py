@@ -136,6 +136,10 @@ class PlacementAlignTests(unittest.TestCase):
         self.assertTrue(sg.is_placement_aligned(86402, [86400], tolerance=2))
         self.assertFalse(sg.is_placement_aligned(86403, [86400], tolerance=2))
 
+    def test_record_frame_adds_timeline_offset(self):
+        self.assertEqual(sg.to_record_frame(10, 86400), 86410)
+        self.assertEqual(sg.to_record_frame(10, 0), 10)
+
 
 if __name__ == "__main__":
     unittest.main()
