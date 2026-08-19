@@ -140,6 +140,12 @@ class PlacementAlignTests(unittest.TestCase):
         self.assertEqual(sg.to_record_frame(10, 86400), 86410)
         self.assertEqual(sg.to_record_frame(10, 0), 10)
 
+    def test_count_gaps(self):
+        cues = [sg.Cue(0, 10, "a"), sg.Cue(20, 30, "b"), sg.Cue(30, 40, "c")]
+        self.assertEqual(sg.count_gaps(cues), [10])
+        filled, _, _ = sg.fill_gaps(cues)
+        self.assertEqual(sg.count_gaps(filled), [])
+
 
 if __name__ == "__main__":
     unittest.main()
