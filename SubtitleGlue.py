@@ -20,7 +20,7 @@ import os
 import sys
 import tempfile
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 SCRIPT_ID = "SubtitleGlueWin"
 MEDIA_FOLDER_NAME = "Subtitle Glue"
 
@@ -279,75 +279,73 @@ def find_or_create_media_folder(media_pool, name):
     return created or root, current
 
 
-def set_playhead_to_start(timeline):
-    getter = getattr(timeline, "GetStartTimecode", None)
-    setter = getattr(timeline, "SetCurrentTimecode", None)
-    if not getter or not setter:
-        return
+def harvest_textplus_template(project, media_pool):
+    """Create a Text+ generator on a throwaway timeline so the user sequence is untouched.
+
+    InsertFusionTitleIntoTimeline on the active timeline inserts a 5-second
+    title at the playhead. With ripple/insert that shoves video, audio and
+    subtitles by exactly 5 seconds.
+    """
+    original = project.GetCurrentTimeline()
+    tmp = None
     try:
-        timecode = getter()
-        if timecode:
-            setter(timecode)
-    except Exception:
-        pass
-
-
-def video_items(timeline):
-    items = []
-    count = int(timeline.GetTrackCount("video") or 0)
-    for index in range(1, count + 1):
-        items.extend(timeline.GetItemListInTrack("video", index) or [])
-    return items
-
-
-def harvest_textplus_template(timeline):
-    """Insert a temporary Text+ title and return its media pool item."""
-    set_playhead_to_start(timeline)
-    before_ids = set(id(item) for item in video_items(timeline))
-    inserted = None
-    for title_name in ("Text+", "Text"):
-        try:
-            inserted = timeline.InsertFusionTitleIntoTimeline(title_name)
-        except Exception:
-            inserted = None
-        if inserted:
-            break
-    item = inserted if inserted and not isinstance(inserted, bool) else None
-    if item is None:
-        for maybe in video_items(timeline):
-            if id(maybe) not in before_ids:
-                item = maybe
+        tmp_name = "__SubtitleGlue_Tmp__"
+        tmp = media_pool.CreateEmptyTimeline(tmp_name)
+        if tmp is None:
+            tmp = media_pool.CreateEmptyTimeline(tmp_name + str(os.getpid()))
+        if tmp is None:
+            return None, 1.0, None
+        project.SetCurrentTimeline(tmp)
+        inserted = None
+        for title_name in ("Text+", "Text"):
+            try:
+                inserted = tmp.InsertFusionTitleIntoTimeline(title_name)
+            except Exception:
+                inserted = None
+            if inserted:
                 break
-    if item is None:
-        return None
-    media_item = item.GetMediaPoolItem()
-    try:
-        timeline.DeleteClips([item], False)
+        item = inserted if inserted and not isinstance(inserted, bool) else None
+        if item is None:
+            items = tmp.GetItemListInTrack("video", 1) or []
+            item = items[0] if items else None
+        if item is None:
+            return None, 1.0, tmp
+        media_item = item.GetMediaPoolItem()
+        multiplier = 1.0
+        if media_item is not None:
+            test_duration = 200
+            test_info = {
+                "mediaPoolItem": media_item,
+                "startFrame": 0,
+                "endFrame": test_duration - 1,
+                "trackIndex": 1,
+                "recordFrame": int(tmp.GetStartFrame() or 0),
+            }
+            test_items = media_pool.AppendToTimeline([test_info])
+            if test_items:
+                real_duration = int(test_items[0].GetDuration() or 0)
+                if real_duration > 0:
+                    multiplier = float(test_duration) / float(real_duration)
+                try:
+                    tmp.DeleteClips(list(test_items), False)
+                except Exception:
+                    pass
+        return media_item, multiplier, tmp
     except Exception:
-        pass
-    return media_item
-
-
-def measure_duration_multiplier(media_pool, timeline, text_clip, track_index):
-    test_duration = 100
-    clip_info = {
-        "mediaPoolItem": text_clip,
-        "startFrame": 0,
-        "endFrame": test_duration - 1,
-        "trackIndex": track_index,
-        "recordFrame": get_timeline_start(timeline),
-    }
-    try:
-        items = media_pool.AppendToTimeline([clip_info])
-        if not items:
-            return 1.0
-        real_duration = int(items[0].GetDuration() or 0)
-        timeline.DeleteClips(list(items), False)
-        if real_duration <= 0:
-            return 1.0
-        return float(test_duration) / float(real_duration)
-    except Exception:
-        return 1.0
+        if tmp is not None:
+            try:
+                deleter = getattr(media_pool, "DeleteTimelines", None)
+                if deleter:
+                    deleter([tmp])
+            except Exception:
+                pass
+        raise
+    finally:
+        if original is not None:
+            try:
+                project.SetCurrentTimeline(original)
+            except Exception:
+                pass
 
 
 def set_textplus_text(timeline_item, text):
@@ -392,12 +390,12 @@ def append_textplus_with_duration(
     media_pool, timeline, text_clip, track_index, record_frame, target_duration, duration_multiplier
 ):
     source_duration = max(1, int(target_duration * duration_multiplier + 0.999))
-    for attempt in range(4):
+    for attempt in range(6):
         clip_info = {
             "mediaPoolItem": text_clip,
             "startFrame": 0,
             "endFrame": source_duration - 1,
-            "trackIndex": track_index,
+            "trackIndex": int(track_index),
             "recordFrame": int(record_frame),
         }
         items = media_pool.AppendToTimeline([clip_info])
@@ -406,58 +404,37 @@ def append_textplus_with_duration(
         timeline_item = items[0]
         actual = int(timeline_item.GetDuration() or 0)
         adjustment = int(target_duration) - actual
-        adjusted = max(1, source_duration + adjustment)
-        if adjustment == 0 or adjusted == source_duration or attempt == 3:
+        if adjustment == 0:
             return timeline_item
         try:
             timeline.DeleteClips([timeline_item], False)
         except Exception:
             return timeline_item
-        source_duration = adjusted
+        if attempt >= 4:
+            source_duration = max(source_duration * 2, int(target_duration) * 4, 10000)
+        else:
+            source_duration = max(1, source_duration + adjustment)
     return None
 
 
 def hide_subtitle_track(timeline, track_index):
-    """Disable the original captions. Delete is attempted but often ignored."""
+    """Turn off the original captions. Do not delete — that can ripple audio."""
     try:
         timeline.SetTrackLock("subtitle", track_index, False)
     except Exception:
         pass
-    items = timeline.GetItemListInTrack("subtitle", track_index) or []
-    if items:
-        try:
-            timeline.DeleteClips(list(items), False)
-        except Exception:
-            pass
-    remaining = timeline.GetItemListInTrack("subtitle", track_index) or []
-    if remaining:
-        try:
-            timeline.DeleteTrack("subtitle", track_index)
-            return "deleted"
-        except Exception:
-            pass
-        try:
-            timeline.SetTrackEnable("subtitle", track_index, False)
+    try:
+        if timeline.SetTrackEnable("subtitle", track_index, False):
             return "disabled"
-        except Exception:
-            return "kept"
-    return "cleared"
+    except Exception:
+        pass
+    return "kept"
 
 
-def export_srt_sidecar(project, cues, fps, track_name):
-    media_pool = project.GetMediaPool()
+def export_srt_sidecar(cues, fps):
     fd, srt_path = tempfile.mkstemp(prefix="subtitle_glue_", suffix=".srt")
     os.close(fd)
     write_srt_file(srt_path, cues, fps)
-    folder, previous = find_or_create_media_folder(media_pool, MEDIA_FOLDER_NAME)
-    if folder:
-        media_pool.SetCurrentFolder(folder)
-    try:
-        media_pool.ImportMedia([os.path.abspath(srt_path)])
-    except Exception:
-        pass
-    if previous:
-        media_pool.SetCurrentFolder(previous)
     return srt_path
 
 
@@ -475,71 +452,88 @@ def rebuild_as_textplus(
         pass
 
     media_pool = project.GetMediaPool()
+    tmp_timeline = None
     folder, previous = find_or_create_media_folder(media_pool, MEDIA_FOLDER_NAME)
     if folder:
         media_pool.SetCurrentFolder(folder)
-
-    text_clip = harvest_textplus_template(timeline)
-    if previous:
-        media_pool.SetCurrentFolder(previous)
-    if text_clip is None:
-        raise RuntimeError(
-            "Не удалось создать шаблон Text+.\n"
-            "Откройте Edit, добавьте вручную Fusion Title «Text+» в Media Pool и повторите."
-        )
-
-    if not timeline.AddTrack("video"):
-        raise RuntimeError("Не удалось создать видеодорожку для Text+.")
-    video_track = int(timeline.GetTrackCount("video"))
-    original_name = timeline.GetTrackName("subtitle", track_index) or ("Subtitle %d" % track_index)
-    timeline.SetTrackName("video", video_track, "%s (без пауз)" % original_name)
-
-    duration_multiplier = measure_duration_multiplier(
-        media_pool, timeline, text_clip, video_track
-    )
-    created = []
-    first_expected = to_record_frame(cues[0].start, offset) if cues else 0
-    for cue in cues:
-        duration = max(1, cue.end - cue.start)
-        record_frame = to_record_frame(cue.start, offset)
-        item = append_textplus_with_duration(
-            media_pool,
-            timeline,
-            text_clip,
-            video_track,
-            record_frame,
-            duration,
-            duration_multiplier,
-        )
-        if item is None:
-            continue
+    try:
+        text_clip, duration_multiplier, tmp_timeline = harvest_textplus_template(project, media_pool)
+    finally:
+        if previous:
+            media_pool.SetCurrentFolder(previous)
         try:
-            item.SetClipColor("Green")
+            project.SetCurrentTimeline(timeline)
         except Exception:
             pass
-        set_textplus_text(item, cue.text)
-        created.append(item)
 
-    if not created:
-        try:
-            timeline.DeleteTrack("video", video_track)
-        except Exception:
-            pass
-        raise RuntimeError("Не удалось поставить Text+ клипы на таймлайн.")
+    try:
+        if text_clip is None:
+            raise RuntimeError(
+                "Не удалось создать шаблон Text+.\n"
+                "Откройте Effects, перетащите Fusion Title «Text+» в Media Pool и повторите."
+            )
 
-    actual_first = int(created[0].GetStart())
-    if not is_placement_aligned(actual_first, [first_expected, offset, 0, get_timeline_start(timeline)]):
-        print(
-            "Subtitle Glue warning: first Text+ starts at %s, expected %s"
-            % (actual_first, first_expected)
-        )
+        if not timeline.AddTrack("video"):
+            raise RuntimeError("Не удалось создать видеодорожку для Text+.")
+        video_track = int(timeline.GetTrackCount("video"))
+        original_name = timeline.GetTrackName("subtitle", track_index) or ("Subtitle %d" % track_index)
+        timeline.SetTrackName("video", video_track, "%s (без пауз)" % original_name)
 
-    hide_status = "kept"
-    if hide_original:
-        hide_status = hide_subtitle_track(timeline, track_index)
+        created = []
+        first_expected = to_record_frame(cues[0].start, offset) if cues else 0
+        for cue in cues:
+            duration = max(1, cue.end - cue.start)
+            record_frame = to_record_frame(cue.start, offset)
+            item = append_textplus_with_duration(
+                media_pool,
+                timeline,
+                text_clip,
+                video_track,
+                record_frame,
+                duration,
+                duration_multiplier,
+            )
+            if item is None:
+                continue
+            try:
+                item.SetClipColor("Green")
+            except Exception:
+                pass
+            set_textplus_text(item, cue.text)
+            created.append(item)
 
-    srt_path = export_srt_sidecar(project, cues, fps, original_name)
-    return srt_path, len(created), hide_status
+        if not created:
+            try:
+                timeline.DeleteTrack("video", video_track)
+            except Exception:
+                pass
+            raise RuntimeError("Не удалось поставить Text+ клипы на таймлайн.")
+
+        actual_first = int(created[0].GetStart())
+        if not is_placement_aligned(actual_first, [first_expected, offset, 0, get_timeline_start(timeline)]):
+            print(
+                "Subtitle Glue warning: first Text+ starts at %s, expected %s"
+                % (actual_first, first_expected)
+            )
+
+        hide_status = "kept"
+        if hide_original:
+            hide_status = hide_subtitle_track(timeline, track_index)
+
+        srt_path = export_srt_sidecar(cues, fps)
+        return srt_path, len(created), hide_status
+    finally:
+        if tmp_timeline is not None:
+            try:
+                project.SetCurrentTimeline(timeline)
+            except Exception:
+                pass
+            deleter = getattr(media_pool, "DeleteTimelines", None)
+            if deleter:
+                try:
+                    deleter([tmp_timeline])
+                except Exception:
+                    pass
 
 
 def glue_tracks(resolve_app, project, timeline, track_indices, gap_frames, max_extend_seconds, replace_original):
