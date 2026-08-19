@@ -86,6 +86,73 @@ class FillGapsTests(unittest.TestCase):
         self.assertEqual(grown, 1)
 
 
+class MoveTrailingNeTests(unittest.TestCase):
+    def test_moves_particle_and_shifts_cut_left(self):
+        cues = [sg.Cue(0, 10, "я не"), sg.Cue(10, 20, "вижу")]
+        moved, count = sg.move_trailing_ne(cues)
+        self.assertEqual(count, 1)
+        self.assertEqual(moved[0].text, "я")
+        self.assertEqual(moved[1].text, "не вижу")
+        self.assertEqual(moved[0].start, 0)
+        self.assertEqual(moved[1].end, 20)
+        self.assertEqual(moved[0].end, moved[1].start)
+        self.assertLess(moved[0].end, 10)
+        self.assertLess(moved[1].start, 10)
+        self.assertEqual(
+            (moved[0].end - moved[0].start) + (moved[1].end - moved[1].start),
+            20,
+        )
+
+    def test_keeps_gap_and_total_duration(self):
+        cues = [sg.Cue(0, 12, "точно не"), sg.Cue(20, 30, "знаю")]
+        before = (12 - 0) + (30 - 20)
+        moved, count = sg.move_trailing_ne(cues)
+        self.assertEqual(count, 1)
+        after = (moved[0].end - moved[0].start) + (moved[1].end - moved[1].start)
+        self.assertEqual(after, before)
+        self.assertEqual(moved[1].start - moved[0].end, 8)
+        self.assertEqual(moved[1].end, 30)
+
+    def test_ignores_words_that_only_contain_ne(self):
+        cues = [sg.Cue(0, 10, "это мене"), sg.Cue(10, 20, "дальше")]
+        moved, count = sg.move_trailing_ne(cues)
+        self.assertEqual(count, 0)
+        self.assertEqual(moved[0].text, "это мене")
+        cues = [sg.Cue(0, 10, "нельзя"), sg.Cue(10, 20, "идти")]
+        moved, count = sg.move_trailing_ne(cues)
+        self.assertEqual(count, 0)
+
+    def test_skips_when_next_already_starts_with_ne(self):
+        cues = [sg.Cue(0, 10, "точно не"), sg.Cue(10, 20, "не знаю")]
+        moved, count = sg.move_trailing_ne(cues)
+        self.assertEqual(count, 0)
+
+    def test_skips_caption_that_is_only_ne(self):
+        cues = [sg.Cue(0, 10, "не"), sg.Cue(10, 20, "сейчас")]
+        moved, count = sg.move_trailing_ne(cues)
+        self.assertEqual(count, 0)
+        self.assertEqual(moved[0].text, "не")
+
+    def test_handles_newline_before_particle(self):
+        cues = [sg.Cue(0, 10, "я тебя\nне"), sg.Cue(10, 20, "вижу")]
+        moved, count = sg.move_trailing_ne(cues)
+        self.assertEqual(count, 1)
+        self.assertEqual(moved[0].text, "я тебя")
+        self.assertEqual(moved[1].text, "не вижу")
+
+    def test_runs_after_gap_fill_without_growing_total(self):
+        cues = [sg.Cue(0, 8, "я не"), sg.Cue(20, 30, "вижу")]
+        filled, grown, extra = sg.fill_gaps(cues)
+        self.assertEqual(grown, 1)
+        moved, count = sg.move_trailing_ne(filled)
+        self.assertEqual(count, 1)
+        self.assertEqual(moved[0].end, moved[1].start)
+        self.assertEqual(
+            (moved[0].end - moved[0].start) + (moved[1].end - moved[1].start),
+            (filled[0].end - filled[0].start) + (filled[1].end - filled[1].start),
+        )
+
+
 class SrtTests(unittest.TestCase):
     def test_timestamp_conversion(self):
         self.assertEqual(sg.frames_to_srt_timestamp(0, 25), "00:00:00,000")
@@ -233,6 +300,38 @@ class DrtRewriteTests(unittest.TestCase):
                     for gen in rewritten.track_elements()[0].iter("Sm2TiGenerator")
                 ]
                 self.assertEqual(ids[0], "11111111-1111-1111-1111-111111111111")
+            finally:
+                rewritten.close()
+        finally:
+            os.remove(path)
+            os.remove(out)
+
+    def test_replace_writes_moved_ne_text(self):
+        path = tempfile.mkstemp(suffix=".drt")[1]
+        out = tempfile.mkstemp(suffix=".drt")[1]
+        try:
+            write_minimal_drt(path)
+            drt = sg.DrtTimeline(path)
+            try:
+                cues = [
+                    sg.Cue(86400, 86410, "я не"),
+                    sg.Cue(86420, 86430, "вижу"),
+                ]
+                moved, count = sg.move_trailing_ne(cues)
+                self.assertEqual(count, 1)
+                drt.replace_track_durations(1, moved)
+                drt.save(out)
+            finally:
+                drt.close()
+            rewritten = sg.DrtTimeline(out)
+            try:
+                replaced = rewritten.track_cues(1)
+                self.assertEqual(replaced[0].text, "я")
+                self.assertEqual(replaced[1].text, "не вижу")
+                self.assertEqual(
+                    (replaced[0].end - replaced[0].start) + (replaced[1].end - replaced[1].start),
+                    20,
+                )
             finally:
                 rewritten.close()
         finally:

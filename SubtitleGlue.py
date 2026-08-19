@@ -3,7 +3,9 @@
 Subtitle Glue for DaVinci Resolve.
 
 Reads generated subtitle clips on the active timeline and removes empty
-gaps by extending each caption until the next one starts.
+gaps by extending each caption until the next one starts. If a caption
+ends with the particle «не», that word is moved to the start of the next
+caption and the cut between them shifts left by the same number of frames.
 
 Resolve cannot trim native subtitle clips, and AppendToTimeline ignores
 recordFrame for SRT — the file always lands after the last existing caption.
@@ -25,7 +27,7 @@ import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 SCRIPT_ID = "SubtitleGlueWin"
 MEDIA_FOLDER_NAME = "Subtitle Glue"
 DRT_BREAK = "<br>"
@@ -96,6 +98,83 @@ def fill_gaps(cues, gap_frames=0, max_extend_frames=0):
         result.append(Cue(cue.start, new_end, cue.text))
 
     return result, filled, extra_frames
+
+
+_NE_PARTICLE = u"\u043d\u0435"
+_TRAILING_NE = re.compile(
+    r"(?us)^(?P<head>.*?)(?:[\s\u00a0]+)"
+    r"(?P<particle>" + _NE_PARTICLE + r")"
+    r"(?P<punct>[.,!?;:\u2026»\"')\]]*)\s*$",
+    re.IGNORECASE,
+)
+_LEADING_NE = re.compile(
+    r"(?u)^\s*" + _NE_PARTICLE + r"\b",
+    re.IGNORECASE,
+)
+
+
+def _visible_len(text):
+    compact = re.sub(r"\s+", " ", (text or "").strip())
+    return max(1, len(compact))
+
+
+def split_trailing_ne(text):
+    """If text ends with the particle «не», return (head, particle), else None."""
+    if not text or not text.strip():
+        return None
+    match = _TRAILING_NE.search(text.rstrip())
+    if not match:
+        return None
+    head = match.group("head").rstrip()
+    particle = match.group("particle")
+    if not head:
+        return None
+    return head, particle
+
+
+def prepend_ne(particle, text):
+    body = (text or "").lstrip()
+    if body and body[0] not in ".,!?;:\u2026":
+        return "%s %s" % (particle, body)
+    return "%s%s" % (particle, body)
+
+
+def move_trailing_ne(cues):
+    """Move a hanging «не» from the end of cue A onto the start of cue B.
+
+    Cue A shrinks from the end, cue B grows from the start by the same
+    number of frames, so A.duration + B.duration stays the same.
+    """
+    if len(cues) < 2:
+        return list(cues), 0
+    result = [
+        Cue(cue.start, cue.end, cue.text)
+        for cue in sorted(cues, key=lambda item: (item.start, item.end))
+    ]
+    moved = 0
+    for index in range(len(result) - 1):
+        current = result[index]
+        nxt = result[index + 1]
+        split = split_trailing_ne(current.text)
+        if split is None:
+            continue
+        if _LEADING_NE.match(nxt.text or ""):
+            continue
+        head, particle = split
+        duration = current.end - current.start
+        delta = 0
+        if duration > 1:
+            share = float(len(particle)) / float(_visible_len(current.text))
+            delta = int(round(duration * share))
+            delta = max(1, min(delta, duration - 1))
+            if current.end - delta <= current.start:
+                delta = 0
+            if nxt.start - delta >= nxt.end:
+                delta = 0
+        result[index] = Cue(current.start, current.end - delta, head)
+        result[index + 1] = Cue(nxt.start - delta, nxt.end, prepend_ne(particle, nxt.text))
+        moved += 1
+    return result, moved
 
 
 def frames_to_srt_timestamp(frame, fps):
@@ -247,6 +326,22 @@ def set_span_on_element(element, start, end):
     return duration
 
 
+def set_generator_name(gen, text):
+    payload = text if text is not None else ""
+    payload = payload.replace("\r\n", "\n").replace("\r", "\n").replace("\n", DRT_BREAK)
+    name_el = gen.find("Name")
+    if name_el is None:
+        name_el = ET.SubElement(gen, "Name")
+    name_el.text = payload
+    return name_el
+
+
+def set_cue_on_element(element, cue):
+    set_span_on_element(element, cue.start, cue.end)
+    gen = next(iter(element.iter("Sm2TiGenerator")), element)
+    set_generator_name(gen, cue.text)
+
+
 def apply_filled_cues_to_track(track_el, filled_cues):
     """Overwrite Start/Duration of the existing cues. Does not add a second track."""
     filled_ordered = sorted(filled_cues, key=lambda cue: (cue.start, cue.end))
@@ -269,13 +364,13 @@ def apply_filled_cues_to_track(track_el, filled_cues):
             paired.append((start, wrapper))
         paired.sort(key=lambda row: row[0])
         for (_start, wrapper), cue in zip(paired, filled_ordered):
-            set_span_on_element(wrapper, cue.start, cue.end)
+            set_cue_on_element(wrapper, cue)
     else:
         gens_ordered = sorted(
             generators, key=lambda gen: int(gen.findtext("Start") or 0)
         )
         for gen, cue in zip(gens_ordered, filled_ordered):
-            set_span_on_element(gen, cue.start, cue.end)
+            set_cue_on_element(gen, cue)
     return len(filled_ordered)
 
 
@@ -630,10 +725,11 @@ def glue_tracks(resolve_app, project, timeline, track_indices, gap_frames, max_e
                     )
                     continue
                 filled, grown, extra = fill_gaps(cues, gap_frames, max_extend_frames)
-                if grown == 0:
+                filled, moved_ne = move_trailing_ne(filled)
+                if grown == 0 and moved_ne == 0:
                     sample = ", ".join("%d-%d" % (cue.start, cue.end) for cue in cues[:4])
                     summaries.append(
-                        "S%d: пауз нет (%d клипов, гэпов %d). Кадры: %s"
+                        "S%d: пауз нет и висячего «не» нет (%d клипов, гэпов %d). Кадры: %s"
                         % (track_index, len(cues), len(gaps), sample)
                     )
                     continue
@@ -644,8 +740,8 @@ def glue_tracks(resolve_app, project, timeline, track_indices, gap_frames, max_e
                 write_srt_file(srt_path, cues_to_relative(filled, origin), fps)
                 seconds = extra / fps
                 summaries.append(
-                    "S%d: старые клипы заменены, удлинено %d из %d (+%.2f с, клипов: %d).\nSRT: %s"
-                    % (track_index, grown, len(cues), seconds, placed, srt_path)
+                    "S%d: старые клипы заменены, удлинено %d из %d (+%.2f с), перенесено «не»: %d.\nSRT: %s"
+                    % (track_index, grown, len(cues), seconds, moved_ne, srt_path)
                 )
             if not replaced:
                 return summaries or ["Нечего обрабатывать."]
@@ -736,10 +832,10 @@ def show_ui_and_run(resolve_app, project, timeline):
                         {
                             "Text": (
                                 "Закрывает паузы между субтитрами, удлиняя каждый клип "
-                                "до начала следующего. Старые клипы на дорожке заменяются "
-                                "новыми без гэпов на тех же таймкодах. Результат — новый "
-                                "таймлайн (исходный не меняется): Resolve не умеет править "
-                                "длительность субтитров на месте."
+                                "до начала следующего. Если субтитр заканчивается на «не», "
+                                "частица переносится в начало следующего, а граница между "
+                                "ними сдвигается влево на ту же длительность. Результат — "
+                                "новый таймлайн (исходный не меняется)."
                             ),
                             "WordWrap": True,
                             "Weight": 0,
