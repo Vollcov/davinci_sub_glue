@@ -146,6 +146,11 @@ class PlacementAlignTests(unittest.TestCase):
         filled, _, _ = sg.fill_gaps(cues)
         self.assertEqual(sg.count_gaps(filled), [])
 
+    def test_first_start_rejects_append_after_old_captions(self):
+        filled = [sg.Cue(86400, 86500, "a"), sg.Cue(86500, 86600, "b")]
+        self.assertTrue(sg.first_start_is_aligned(86400, filled, 86400))
+        self.assertFalse(sg.first_start_is_aligned(90000, filled, 86400))
+
 
 if __name__ == "__main__":
     unittest.main()

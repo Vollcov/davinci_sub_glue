@@ -20,7 +20,7 @@ import os
 import sys
 import tempfile
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 SCRIPT_ID = "SubtitleGlueWin"
 MEDIA_FOLDER_NAME = "Subtitle Glue"
 
@@ -174,6 +174,15 @@ def is_placement_aligned(actual_start, expected_starts, tolerance=2):
         if abs(actual_start - int(expected)) <= int(tolerance):
             return True
     return False
+
+
+def first_start_is_aligned(actual_start, filled_cues, origin, tolerance=2):
+    """True if the first placed caption starts with the original first cue."""
+    expected = []
+    if filled_cues:
+        expected.append(filled_cues[0].start)
+    expected.extend([origin, 0])
+    return is_placement_aligned(actual_start, expected, tolerance)
 
 
 # ---------------------------------------------------------------------------
@@ -602,79 +611,108 @@ def srt_track_has_filled_cues(timeline, track_index, filled_cues, origin):
     items = subtitle_track_items(timeline, track_index)
     if not items:
         return False
+    first_start = min(item_span(item)[0] for item in items)
+    if not first_start_is_aligned(first_start, filled_cues, origin):
+        return False
     if len(items) == 1:
         start, end = item_span(items[0])
         needed = filled_cues[-1].end - filled_cues[0].start
-        at_origin = (
-            abs(start - filled_cues[0].start) <= 2
-            or abs(start - int(origin or 0)) <= 2
-            or abs(start) <= 2
-        )
-        long_enough = (end - start) >= max(1, needed - 2)
-        return at_origin and long_enough
+        return (end - start) >= max(1, needed - 2)
     spans = [Cue(item_span(item)[0], item_span(item)[1], "") for item in items]
     gaps = count_gaps(spans)
     return (not gaps) or max(gaps) <= 1
 
 
-def try_place_filled_srt(project, timeline, filled_cues, origin, fps, source_track):
-    """Put a gap-filled SRT on a new empty subtitle track after locking the old ones."""
-    media_pool = project.GetMediaPool()
-    srt_path = export_srt_sidecar(cues_to_relative(filled_cues, origin), fps)
-    before_empty = set(empty_subtitle_tracks(timeline))
-    if not timeline.AddTrack("subtitle"):
-        return False, srt_path, "no-track"
-    created = [index for index in empty_subtitle_tracks(timeline) if index not in before_empty]
-    new_index = max(created) if created else int(timeline.GetTrackCount("subtitle"))
+def count_subtitle_clips(timeline):
+    total = 0
+    for index in range(1, int(timeline.GetTrackCount("subtitle") or 0) + 1):
+        total += len(subtitle_track_items(timeline, index))
+    return total
 
+
+def clear_all_subtitle_clips(timeline):
+    """Remove subtitle clips so SRT is not appended after them. No ripple."""
     count = int(timeline.GetTrackCount("subtitle") or 0)
-    saved = []
-    for index in range(1, count + 1):
-        saved.append(
-            (
-                index,
-                bool(timeline.GetIsTrackLocked("subtitle", index)),
-                bool(timeline.GetIsTrackEnabled("subtitle", index)),
-            )
-        )
-        if index == new_index:
-            timeline.SetTrackLock("subtitle", index, False)
-            timeline.SetTrackEnable("subtitle", index, True)
-        else:
-            timeline.SetTrackLock("subtitle", index, True)
-            timeline.SetTrackEnable("subtitle", index, False)
-
-    set_playhead_start(timeline)
-    imported = media_pool.ImportMedia([os.path.abspath(srt_path)])
-    clip = imported[0] if imported else None
-    ok = srt_track_has_filled_cues(timeline, new_index, filled_cues, origin)
-    if (not ok) and clip is not None:
-        for record_frame in (int(origin or 0), 0, get_timeline_start(timeline), int(filled_cues[0].start)):
-            media_pool.AppendToTimeline(
-                [{
-                    "mediaPoolItem": clip,
-                    "recordFrame": int(record_frame),
-                    "trackIndex": int(new_index),
-                }]
-            )
-            ok = srt_track_has_filled_cues(timeline, new_index, filled_cues, origin)
-            if ok:
-                break
-
-    for index, locked, enabled in saved:
-        if index == new_index or index > int(timeline.GetTrackCount("subtitle") or 0):
-            continue
+    for index in range(count, 0, -1):
         try:
-            timeline.SetTrackLock("subtitle", index, locked)
-            timeline.SetTrackEnable("subtitle", index, False if ok else enabled)
+            timeline.SetTrackLock("subtitle", index, False)
         except Exception:
             pass
+        items = subtitle_track_items(timeline, index)
+        if items:
+            try:
+                timeline.DeleteClips(list(items), False)
+            except Exception:
+                pass
+        if subtitle_track_items(timeline, index):
+            try:
+                timeline.DeleteTrack("subtitle", index)
+            except Exception:
+                pass
+    return count_subtitle_clips(timeline)
+
+
+def try_place_filled_srt(project, timeline, filled_cues, origin, fps, source_track):
+    """Place a gap-filled SRT at the original start, not after leftover captions."""
+    media_pool = project.GetMediaPool()
+    source_name = timeline.GetTrackName("subtitle", source_track) or "Subtitle"
+    srt_path = export_srt_sidecar(cues_to_relative(filled_cues, origin), fps)
+    imported = media_pool.ImportMedia([os.path.abspath(srt_path)])
+    clip = imported[0] if imported else None
+    if clip is None:
+        return False, srt_path, "no-import"
+
+    remaining = clear_all_subtitle_clips(timeline)
+    if remaining > 0:
+        return False, srt_path, "could-not-clear"
+
+    if int(timeline.GetTrackCount("subtitle") or 0) == 0:
+        if not timeline.AddTrack("subtitle"):
+            return False, srt_path, "no-track"
+    new_index = None
+    empty = empty_subtitle_tracks(timeline)
+    if empty:
+        new_index = max(empty)
+    else:
+        if not timeline.AddTrack("subtitle"):
+            return False, srt_path, "no-track"
+        empty = empty_subtitle_tracks(timeline)
+        new_index = max(empty) if empty else int(timeline.GetTrackCount("subtitle"))
+
+    try:
+        timeline.SetTrackLock("subtitle", new_index, False)
+        timeline.SetTrackEnable("subtitle", new_index, True)
+    except Exception:
+        pass
+    timeline.SetTrackName("subtitle", new_index, "%s (без пауз)" % source_name)
+
+    set_playhead_start(timeline)
+    ok = False
+    for record_frame in (int(filled_cues[0].start), int(origin or 0), 0, get_timeline_start(timeline)):
+        try:
+            leftovers = subtitle_track_items(timeline, new_index)
+            if leftovers:
+                timeline.DeleteClips(leftovers, False)
+        except Exception:
+            pass
+        placed = media_pool.AppendToTimeline(
+            [{
+                "mediaPoolItem": clip,
+                "recordFrame": int(record_frame),
+                "trackIndex": int(new_index),
+            }]
+        )
+        if not placed:
+            continue
+        ok = srt_track_has_filled_cues(timeline, new_index, filled_cues, origin)
+        if ok:
+            break
 
     if not ok:
         try:
-            items = subtitle_track_items(timeline, new_index)
-            if items:
-                timeline.DeleteClips(items, False)
+            leftovers = subtitle_track_items(timeline, new_index)
+            if leftovers:
+                timeline.DeleteClips(leftovers, False)
         except Exception:
             pass
         try:
@@ -683,8 +721,6 @@ def try_place_filled_srt(project, timeline, filled_cues, origin, fps, source_tra
             pass
         return False, srt_path, "misplaced"
 
-    source_name = timeline.GetTrackName("subtitle", source_track) or "Subtitle"
-    timeline.SetTrackName("subtitle", new_index, "%s (без пауз)" % source_name)
     return True, srt_path, "ok"
 
 
