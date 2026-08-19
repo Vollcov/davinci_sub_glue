@@ -8,25 +8,24 @@ gaps by extending each caption until the next one starts.
 Resolve cannot trim native subtitle clips, and AppendToTimeline ignores
 recordFrame for SRT — the file always lands after the last existing caption.
 The working fix (same as the spelling script) is Resolve's own .drt format:
-export the timeline, clone the subtitle track with new durations, re-import.
-That creates a new timeline with captions on the original timecode.
+export the timeline, replace subtitle durations on the existing track,
+re-import. That creates a new timeline with the old captions already
+replaced at the original timecode — no extra subtitle track.
 
 Run from: Workspace > Scripts > Utility > SubtitleGlue
 """
 
 from __future__ import print_function
 
-import copy
 import os
 import re
 import shutil
 import sys
 import tempfile
-import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 SCRIPT_ID = "SubtitleGlueWin"
 MEDIA_FOLDER_NAME = "Subtitle Glue"
 DRT_BREAK = "<br>"
@@ -248,13 +247,36 @@ def set_span_on_element(element, start, end):
     return duration
 
 
-def retag_drt_ids(element):
-    for node in element.iter():
-        if "DbId" in node.attrib:
-            node.set("DbId", str(uuid.uuid4()))
-        if node.tag == "DbId" or node.tag.endswith("DbId"):
-            if node.text:
-                node.text = str(uuid.uuid4())
+def apply_filled_cues_to_track(track_el, filled_cues):
+    """Overwrite Start/Duration of the existing cues. Does not add a second track."""
+    filled_ordered = sorted(filled_cues, key=lambda cue: (cue.start, cue.end))
+    generators = list(track_el.iter("Sm2TiGenerator"))
+    if not generators:
+        raise DrtError("subtitle track is empty")
+    if len(filled_ordered) != len(generators):
+        raise DrtError(
+            "track has %d cues but fill produced %d" % (len(generators), len(filled_ordered))
+        )
+    item_wrappers = []
+    items_el = track_el.find(".//Items")
+    if items_el is not None:
+        item_wrappers = list(items_el.findall("Element"))
+    if len(item_wrappers) == len(filled_ordered):
+        paired = []
+        for wrapper in item_wrappers:
+            gen = next(iter(wrapper.iter("Sm2TiGenerator")), None)
+            start = int(gen.findtext("Start") or 0) if gen is not None else 0
+            paired.append((start, wrapper))
+        paired.sort(key=lambda row: row[0])
+        for (_start, wrapper), cue in zip(paired, filled_ordered):
+            set_span_on_element(wrapper, cue.start, cue.end)
+    else:
+        gens_ordered = sorted(
+            generators, key=lambda gen: int(gen.findtext("Start") or 0)
+        )
+        for gen, cue in zip(gens_ordered, filled_ordered):
+            set_span_on_element(gen, cue.start, cue.end)
+    return len(filled_ordered)
 
 
 def generator_text(gen):
@@ -270,7 +292,7 @@ def cues_from_generators(generators):
 
 
 class DrtTimeline(object):
-    """Open a .drt, clone a subtitle track with new cue durations, save it back.
+    """Open a .drt, replace subtitle cue durations on the existing track, save it back.
 
     A .drt is a zip. SeqContainer/<uuid>.xml holds SubtitleTrackVec. AppendToTimeline
     cannot place SRT on the original timecode; rewriting this XML can.
@@ -350,53 +372,13 @@ class DrtTimeline(object):
             return "Subtitle %d" % track_index
         return name_el.text.strip()
 
-    def add_filled_track(self, source_index, filled_cues, name):
-        """Clone subtitle track `source_index` and set each cue's duration from filled_cues."""
+    def replace_track_durations(self, source_index, filled_cues):
+        """Replace cue durations on the existing subtitle track. No second track is added."""
         elements = self.track_elements()
         if source_index < 1 or source_index > len(elements):
             raise DrtError("no subtitle track %d (found %d)" % (source_index, len(elements)))
         source = elements[source_index - 1]
-        generators = list(source.iter("Sm2TiGenerator"))
-        if not generators:
-            raise DrtError("subtitle track %d is empty" % source_index)
-        filled_ordered = sorted(filled_cues, key=lambda cue: (cue.start, cue.end))
-        if len(filled_ordered) != len(generators):
-            raise DrtError(
-                "track %d has %d cues but fill produced %d"
-                % (source_index, len(generators), len(filled_ordered))
-            )
-
-        clone = copy.deepcopy(source)
-        retag_drt_ids(clone)
-        item_wrappers = []
-        items_el = clone.find(".//Items")
-        if items_el is not None:
-            item_wrappers = list(items_el.findall("Element"))
-        if len(item_wrappers) == len(filled_ordered):
-            paired = []
-            for wrapper in item_wrappers:
-                gen = next(iter(wrapper.iter("Sm2TiGenerator")), None)
-                start = int(gen.findtext("Start") or 0) if gen is not None else 0
-                paired.append((start, wrapper, gen))
-            paired.sort(key=lambda row: row[0])
-            for (_start, wrapper, gen), cue in zip(paired, filled_ordered):
-                target = wrapper if wrapper is not None else gen
-                set_span_on_element(target, cue.start, cue.end)
-        else:
-            clone_gens = sorted(
-                list(clone.iter("Sm2TiGenerator")),
-                key=lambda gen: int(gen.findtext("Start") or 0),
-            )
-            for gen, cue in zip(clone_gens, filled_ordered):
-                set_span_on_element(gen, cue.start, cue.end)
-
-        udn = clone.find(".//UserDefinedName")
-        if udn is None:
-            track_el = clone.find("Sm2TiTrack")
-            udn = ET.SubElement(track_el if track_el is not None else clone, "UserDefinedName")
-        udn.text = name
-        self._vec.append(clone)
-        return len(filled_ordered)
+        return apply_filled_cues_to_track(source, filled_cues)
 
     def save(self, out_path):
         self._dump(self._root, self._seq_path)
@@ -613,8 +595,8 @@ def import_timeline_drt(project, path):
     return imported
 
 
-def glue_tracks(resolve_app, project, timeline, track_indices, gap_frames, max_extend_seconds, hide_original):
-    """Fill gaps by cloning subtitle tracks inside a .drt export, then re-import."""
+def glue_tracks(resolve_app, project, timeline, track_indices, gap_frames, max_extend_seconds, hide_original=True):
+    """Fill gaps by replacing subtitle durations inside a .drt export, then re-import."""
     fps = get_fps(timeline)
     origin = get_timeline_start(timeline)
     max_extend_frames = int(round(float(max_extend_seconds) * fps)) if max_extend_seconds else 0
@@ -629,7 +611,7 @@ def glue_tracks(resolve_app, project, timeline, track_indices, gap_frames, max_e
     drt_in = os.path.join(tmp, "source.drt")
     drt_out = os.path.join(tmp, safe_filename(wanted_name) + ".drt")
     summaries = []
-    source_indices = []
+    replaced = 0
 
     try:
         export_timeline_drt(resolve_app, timeline, drt_in)
@@ -655,20 +637,17 @@ def glue_tracks(resolve_app, project, timeline, track_indices, gap_frames, max_e
                         % (track_index, len(cues), len(gaps), sample)
                     )
                     continue
-                original_name = drt.track_name(track_index)
-                placed = drt.add_filled_track(
-                    track_index, filled, "%s (без пауз)" % original_name
-                )
-                source_indices.append(track_index)
+                placed = drt.replace_track_durations(track_index, filled)
+                replaced += 1
                 fd, srt_path = tempfile.mkstemp(prefix="subtitle_glue_", suffix=".srt")
                 os.close(fd)
                 write_srt_file(srt_path, cues_to_relative(filled, origin), fps)
                 seconds = extra / fps
                 summaries.append(
-                    "S%d: удлинено %d из %d (+%.2f с, клипов: %d) на исходном таймкоде.\nSRT: %s"
+                    "S%d: старые клипы заменены, удлинено %d из %d (+%.2f с, клипов: %d).\nSRT: %s"
                     % (track_index, grown, len(cues), seconds, placed, srt_path)
                 )
-            if not source_indices:
+            if not replaced:
                 return summaries or ["Нечего обрабатывать."]
             drt.save(drt_out)
         finally:
@@ -680,28 +659,9 @@ def glue_tracks(resolve_app, project, timeline, track_indices, gap_frames, max_e
                 new_timeline.SetName(wanted_name)
             except Exception:
                 pass
-
-        subtitle_count = int(new_timeline.GetTrackCount("subtitle") or 0)
-        hide_status = "kept"
-        if hide_original:
-            hide_status = "disabled"
-            for index in source_indices:
-                if hide_subtitle_track(new_timeline, index) != "disabled":
-                    hide_status = "kept"
-        for index in range(subtitle_count - len(source_indices) + 1, subtitle_count + 1):
-            try:
-                new_timeline.SetTrackEnable("subtitle", index, True)
-                new_timeline.SetTrackLock("subtitle", index, False)
-            except Exception:
-                pass
-
-        hide_note = {
-            "disabled": "исходные subtitle-дорожки на новом таймлайне отключены",
-            "kept": "исходные subtitle-дорожки оставлены включёнными",
-        }.get(hide_status, hide_status)
         summaries.append(
-            "Новый таймлайн: %s. Исходный не изменён. %s."
-            % (new_timeline.GetName(), hide_note)
+            "Новый таймлайн: %s. На нём те же subtitle-дорожки, уже без пауз. Исходный таймлайн не изменён."
+            % new_timeline.GetName()
         )
         return summaries
     finally:
@@ -776,10 +736,10 @@ def show_ui_and_run(resolve_app, project, timeline):
                         {
                             "Text": (
                                 "Закрывает паузы между субтитрами, удлиняя каждый клип "
-                                "до начала следующего. Resolve не умеет ставить SRT в нужный "
-                                "кадр, поэтому результат приходит на новый таймлайн через "
-                                "экспорт .drt — как в скрипте орфографии. Исходный таймлайн "
-                                "не меняется, новые субтитры остаются на исходном таймкоде."
+                                "до начала следующего. Старые клипы на дорожке заменяются "
+                                "новыми без гэпов на тех же таймкодах. Результат — новый "
+                                "таймлайн (исходный не меняется): Resolve не умеет править "
+                                "длительность субтитров на месте."
                             ),
                             "WordWrap": True,
                             "Weight": 0,
@@ -822,14 +782,6 @@ def show_ui_and_run(resolve_app, project, timeline):
                             ),
                         ],
                     ),
-                    ui.CheckBox(
-                        {
-                            "ID": "replaceCheck",
-                            "Text": "Отключить исходную subtitle-дорожку на новом таймлайне",
-                            "Checked": True,
-                            "Weight": 0,
-                        }
-                    ),
                     ui.Label({"ID": "status", "Text": "", "WordWrap": True, "Weight": 1}),
                     ui.HGroup(
                         {"Weight": 0},
@@ -858,7 +810,6 @@ def show_ui_and_run(resolve_app, project, timeline):
         combo_index = int(items["trackCombo"].CurrentIndex)
         gap_frames = int(items["gapSpin"].Value)
         max_seconds = int(items["maxSpin"].Value)
-        hide_original = bool(items["replaceCheck"].Checked)
         if combo_index <= 0:
             selected = [track["index"] for track in tracks if track["count"] > 0]
         else:
@@ -875,7 +826,6 @@ def show_ui_and_run(resolve_app, project, timeline):
                 selected,
                 gap_frames,
                 max_seconds,
-                hide_original,
             )
         except Exception as exc:
             items["status"].Text = "Ошибка: %s" % exc
@@ -938,7 +888,7 @@ def main():
             return 1
         try:
             summaries = glue_tracks(
-                resolve_app, project, timeline, selected, 0, 0, True
+                resolve_app, project, timeline, selected, 0, 0
             )
         except Exception as exc:
             print("Ошибка: %s" % exc)

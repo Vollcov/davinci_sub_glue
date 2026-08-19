@@ -199,7 +199,7 @@ def write_minimal_drt(path):
 
 
 class DrtRewriteTests(unittest.TestCase):
-    def test_clone_extends_duration_and_keeps_start(self):
+    def test_replace_extends_duration_on_same_track(self):
         path = tempfile.mkstemp(suffix=".drt")[1]
         out = tempfile.mkstemp(suffix=".drt")[1]
         try:
@@ -213,7 +213,7 @@ class DrtRewriteTests(unittest.TestCase):
                 self.assertEqual(grown, 1)
                 self.assertEqual(extra, 10)
                 self.assertEqual(filled[0].end, 86420)
-                placed = drt.add_filled_track(1, filled, "Subtitle 1 (без пауз)")
+                placed = drt.replace_track_durations(1, filled)
                 self.assertEqual(placed, 2)
                 drt.save(out)
             finally:
@@ -221,20 +221,18 @@ class DrtRewriteTests(unittest.TestCase):
 
             rewritten = sg.DrtTimeline(out)
             try:
-                self.assertEqual(len(rewritten.track_elements()), 2)
-                self.assertEqual(rewritten.track_name(2), "Subtitle 1 (без пауз)")
-                cloned = rewritten.track_cues(2)
-                self.assertEqual(cloned[0].start, 86400)
-                self.assertEqual(cloned[0].end, 86420)
-                self.assertEqual(cloned[1].start, 86420)
-                self.assertEqual(cloned[1].end, 86430)
-                original = rewritten.track_cues(1)
-                self.assertEqual(original[0].end, 86410)
+                self.assertEqual(len(rewritten.track_elements()), 1)
+                self.assertEqual(rewritten.track_name(1), "Subtitle 1")
+                replaced = rewritten.track_cues(1)
+                self.assertEqual(replaced[0].start, 86400)
+                self.assertEqual(replaced[0].end, 86420)
+                self.assertEqual(replaced[1].start, 86420)
+                self.assertEqual(replaced[1].end, 86430)
                 ids = [
                     gen.attrib.get("DbId")
-                    for gen in rewritten.track_elements()[1].iter("Sm2TiGenerator")
+                    for gen in rewritten.track_elements()[0].iter("Sm2TiGenerator")
                 ]
-                self.assertNotIn("11111111-1111-1111-1111-111111111111", ids)
+                self.assertEqual(ids[0], "11111111-1111-1111-1111-111111111111")
             finally:
                 rewritten.close()
         finally:
@@ -249,7 +247,7 @@ class DrtRewriteTests(unittest.TestCase):
             drt = sg.DrtTimeline(path)
             try:
                 filled, _, _ = sg.fill_gaps(drt.track_cues(1))
-                drt.add_filled_track(1, filled, "filled")
+                drt.replace_track_durations(1, filled)
                 drt.save(out)
             finally:
                 drt.close()
