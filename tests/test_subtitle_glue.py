@@ -117,5 +117,25 @@ class SrtTests(unittest.TestCase):
             os.remove(path)
 
 
+class PlacementAlignTests(unittest.TestCase):
+    def test_record_frame_tries_zero_before_timeline_start(self):
+        self.assertEqual(
+            sg.record_frame_candidates(86400, 86400, 86410),
+            [0, 86400, 86410],
+        )
+
+    def test_accepts_timeline_origin_and_rejects_append_at_end(self):
+        expected = sg.record_frame_candidates(86400, 86400, 86410)
+        self.assertTrue(sg.is_placement_aligned(0, expected))
+        self.assertTrue(sg.is_placement_aligned(86400, expected))
+        self.assertTrue(sg.is_placement_aligned(86410, expected))
+        self.assertFalse(sg.is_placement_aligned(90000, expected))
+        self.assertFalse(sg.is_placement_aligned(None, expected))
+
+    def test_alignment_tolerance(self):
+        self.assertTrue(sg.is_placement_aligned(86402, [86400], tolerance=2))
+        self.assertFalse(sg.is_placement_aligned(86403, [86400], tolerance=2))
+
+
 if __name__ == "__main__":
     unittest.main()
