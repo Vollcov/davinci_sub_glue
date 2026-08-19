@@ -3,6 +3,7 @@ import importlib.util
 import os
 import tempfile
 import unittest
+import zipfile
 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -150,6 +151,118 @@ class PlacementAlignTests(unittest.TestCase):
         filled = [sg.Cue(86400, 86500, "a"), sg.Cue(86500, 86600, "b")]
         self.assertTrue(sg.first_start_is_aligned(86400, filled, 86400))
         self.assertFalse(sg.first_start_is_aligned(90000, filled, 86400))
+
+
+MINIMAL_DRT_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<Sequence>
+  <ListMgt__CC__LmVersionTable></ListMgt__CC__LmVersionTable>
+  <SubtitleTrackVec>
+    <Element>
+      <Sm2TiTrack DbId="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa">
+        <UserDefinedName>Subtitle 1</UserDefinedName>
+        <Items>
+          <Element>
+            <Sm2TiGenerator DbId="11111111-1111-1111-1111-111111111111">
+              <PrettyType>Subtitle</PrettyType>
+              <Name>hello&lt;br&gt;there</Name>
+              <Start>86400</Start>
+              <Duration>10</Duration>
+            </Sm2TiGenerator>
+          </Element>
+          <Element>
+            <Sm2TiGenerator DbId="22222222-2222-2222-2222-222222222222">
+              <PrettyType>Subtitle</PrettyType>
+              <Name>world</Name>
+              <Start>86420</Start>
+              <Duration>10</Duration>
+            </Sm2TiGenerator>
+          </Element>
+        </Items>
+      </Sm2TiTrack>
+    </Element>
+  </SubtitleTrackVec>
+</Sequence>
+"""
+
+
+def write_minimal_drt(path):
+    xml = MINIMAL_DRT_XML.replace("ListMgt__CC__LmVersionTable", "ListMgt::LmVersionTable")
+    seq_name = "SeqContainer/timeline.xml"
+    tmp_xml = tempfile.NamedTemporaryFile(suffix=".xml", delete=False)
+    try:
+        tmp_xml.write(xml.encode("utf-8"))
+        tmp_xml.close()
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.write(tmp_xml.name, seq_name)
+    finally:
+        os.remove(tmp_xml.name)
+
+
+class DrtRewriteTests(unittest.TestCase):
+    def test_clone_extends_duration_and_keeps_start(self):
+        path = tempfile.mkstemp(suffix=".drt")[1]
+        out = tempfile.mkstemp(suffix=".drt")[1]
+        try:
+            write_minimal_drt(path)
+            drt = sg.DrtTimeline(path)
+            try:
+                cues = drt.track_cues(1)
+                self.assertEqual(cues[0], sg.Cue(86400, 86410, "hello\nthere"))
+                self.assertEqual(cues[1], sg.Cue(86420, 86430, "world"))
+                filled, grown, extra = sg.fill_gaps(cues)
+                self.assertEqual(grown, 1)
+                self.assertEqual(extra, 10)
+                self.assertEqual(filled[0].end, 86420)
+                placed = drt.add_filled_track(1, filled, "Subtitle 1 (без пауз)")
+                self.assertEqual(placed, 2)
+                drt.save(out)
+            finally:
+                drt.close()
+
+            rewritten = sg.DrtTimeline(out)
+            try:
+                self.assertEqual(len(rewritten.track_elements()), 2)
+                self.assertEqual(rewritten.track_name(2), "Subtitle 1 (без пауз)")
+                cloned = rewritten.track_cues(2)
+                self.assertEqual(cloned[0].start, 86400)
+                self.assertEqual(cloned[0].end, 86420)
+                self.assertEqual(cloned[1].start, 86420)
+                self.assertEqual(cloned[1].end, 86430)
+                original = rewritten.track_cues(1)
+                self.assertEqual(original[0].end, 86410)
+                ids = [
+                    gen.attrib.get("DbId")
+                    for gen in rewritten.track_elements()[1].iter("Sm2TiGenerator")
+                ]
+                self.assertNotIn("11111111-1111-1111-1111-111111111111", ids)
+            finally:
+                rewritten.close()
+        finally:
+            os.remove(path)
+            os.remove(out)
+
+    def test_roundtrip_preserves_colon_colon_tags(self):
+        path = tempfile.mkstemp(suffix=".drt")[1]
+        out = tempfile.mkstemp(suffix=".drt")[1]
+        try:
+            write_minimal_drt(path)
+            drt = sg.DrtTimeline(path)
+            try:
+                filled, _, _ = sg.fill_gaps(drt.track_cues(1))
+                drt.add_filled_track(1, filled, "filled")
+                drt.save(out)
+            finally:
+                drt.close()
+            with zipfile.ZipFile(out) as archive:
+                xml = archive.read("SeqContainer/timeline.xml").decode("utf-8")
+            self.assertIn("ListMgt::LmVersionTable", xml)
+            self.assertNotIn("__CC__", xml)
+        finally:
+            os.remove(path)
+            os.remove(out)
+
+    def test_safe_filename_strips_illegal_chars(self):
+        self.assertEqual(sg.safe_filename('a/b:c*d'), "a_b_c_d")
 
 
 if __name__ == "__main__":
